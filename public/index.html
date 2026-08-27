@@ -248,6 +248,23 @@ function fmtDate(d){
   const dt = new Date(d);
   return dt.toLocaleDateString(undefined, {month:'short', day:'numeric', year:'numeric'});
 }
+// Guards against a known <input type="date"> quirk: typing a 2-digit year quickly can get
+// stored literally as year 0026 instead of 2026. Rather than just rejecting it, auto-correct
+// any year under 100 to the 2000s — far more forgiving for phone/field entry than requiring
+// the user to retype all 4 digits perfectly.
+function normalizeDateValue(dateStr){
+  if(!dateStr) return dateStr;
+  const parts = String(dateStr).split('-');
+  if(parts.length !== 3) return dateStr;
+  let y = Number(parts[0]);
+  if(y < 100) y += 2000;
+  return String(y).padStart(4,'0') + '-' + parts[1] + '-' + parts[2];
+}
+function yearIsSane(dateStr){
+  if(!dateStr) return true;
+  const y = Number(String(dateStr).slice(0,4));
+  return y >= 1990 && y <= 2100;
+}
 
 /* ==================== API ==================== */
 async function api(path, opts){
@@ -647,15 +664,32 @@ function openProjectModal(existing){
     const errEl = document.getElementById('pf-error');
     const projectNumber = document.getElementById('pf-number').value.trim();
     const projectName = document.getElementById('pf-name').value.trim();
-    const ntpDate = document.getElementById('pf-ntp').value;
-    const actualStartDate = document.getElementById('pf-actual-start').value;
+    const ntpDate = normalizeDateValue(document.getElementById('pf-ntp').value);
+    const actualStartDate = normalizeDateValue(document.getElementById('pf-actual-start').value);
     const contractType = document.getElementById('pf-contract-type').value;
-    const contractValue = document.getElementById('pf-contract-value').value;
+    let contractValue = document.getElementById('pf-contract-value').value;
+    if(contractType==='date') contractValue = normalizeDateValue(contractValue);
     if(!projectNumber || !projectName){ errEl.textContent = 'Project number and name are required.'; return; }
     if(!ntpDate){ errEl.textContent = 'NTP date is required to calculate schedule.'; return; }
     if(!contractValue){ errEl.textContent = 'Contract completion value is required.'; return; }
     if((contractType==='calendar-start' || contractType==='working-start') && !actualStartDate){
       errEl.textContent = 'Actual Start Date is required for this contract completion type.'; return;
+    }
+    if(!yearIsSane(ntpDate)){ errEl.textContent = 'The NTP Date year looks wrong (check it reads a full 4-digit year, e.g. 2026, not 26).'; return; }
+    if(!yearIsSane(actualStartDate)){ errEl.textContent = 'The Actual Start Date year looks wrong (check it reads a full 4-digit year, e.g. 2026, not 26).'; return; }
+    if(contractType==='date' && !yearIsSane(contractValue)){ errEl.textContent = 'The Completion Date year looks wrong (check it reads a full 4-digit year, e.g. 2026, not 26).'; return; }
+    for(const m of modalMilestones){
+      if(!m.label) continue;
+      const mType = normalizeType(m.type);
+      if(mType==='range'){
+        if(m.startDate) m.startDate = normalizeDateValue(m.startDate);
+        if(m.endDate) m.endDate = normalizeDateValue(m.endDate);
+        if(m.startDate && !yearIsSane(m.startDate)){ errEl.textContent = `Milestone "${m.label}": Start Date year looks wrong.`; return; }
+        if(m.endDate && !yearIsSane(m.endDate)){ errEl.textContent = `Milestone "${m.label}": Stop Date year looks wrong.`; return; }
+      } else if(mType==='date' && m.value){
+        m.value = normalizeDateValue(m.value);
+        if(!yearIsSane(m.value)){ errEl.textContent = `Milestone "${m.label}": Date year looks wrong.`; return; }
+      }
     }
 
     const newP = {

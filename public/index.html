@@ -166,28 +166,65 @@ function calendarWorkingDaysBetween(from, to){
 }
 function todayMidnight(){ const t = new Date(); t.setHours(0,0,0,0); return t; }
 
-// A schedule "target" can be the overall contract or an individual milestone.
-// type: 'calendar' (X calendar days from NTP), 'working' (X working days from NTP), 'date' (fixed date)
-function targetEndDate(ntpDate, type, value){
-  if(type==='date') return new Date(value);
-  const start = new Date(ntpDate);
-  if(type==='working') return addWorkingDays(start, value);
-  return addCalendarDays(start, value);
+// A schedule "target" (the overall contract, or an individual milestone) can be anchored
+// off two different dates: Notice to Proceed (NTP) or the Actual Start date — since contracts
+// sometimes count days from NTP and sometimes from when work actually began.
+// type values:
+//   'calendar-ntp'   - X calendar days from NTP
+//   'working-ntp'    - X working days from NTP (skips weekends)
+//   'calendar-start' - X calendar days from Actual Start
+//   'working-start'  - X working days from Actual Start
+//   'date'           - a single fixed target date
+//   'range'          - (milestones only) a defined start date + stop date window
+function normalizeType(type){
+  // Backward-compat: earlier version only had NTP-anchored types under these names.
+  if(type==='calendar') return 'calendar-ntp';
+  if(type==='working') return 'working-ntp';
+  return type || 'calendar-ntp';
 }
-function daysRemaining(ntpDate, type, value){
-  const end = targetEndDate(ntpDate, type, value);
+function isWorkingType(type){ type = normalizeType(type); return type==='working-ntp' || type==='working-start'; }
+function anchorDateFor(p, type){
+  type = normalizeType(type);
+  if(type==='calendar-start' || type==='working-start') return p.actualStartDate || p.ntpDate;
+  return p.ntpDate;
+}
+function targetEndDate(p, type, value){
+  type = normalizeType(type);
+  if(type==='date') return new Date(value);
+  const anchor = new Date(anchorDateFor(p, type));
+  return isWorkingType(type) ? addWorkingDays(anchor, value) : addCalendarDays(anchor, value);
+}
+function daysRemaining(p, type, value){
+  const end = targetEndDate(p, type, value);
   const today = todayMidnight();
   end.setHours(0,0,0,0);
-  if(type==='working') return workingDaysBetween(today, end);
-  return calendarDaysBetween(today, end);
+  return isWorkingType(type) ? workingDaysBetween(today, end) : calendarDaysBetween(today, end);
 }
-function totalDuration(ntpDate, type, value){
+function totalDuration(p, type, value){
+  type = normalizeType(type);
   if(type==='date'){
-    const start = new Date(ntpDate); start.setHours(0,0,0,0);
+    const anchor = new Date(anchorDateFor(p, type)); anchor.setHours(0,0,0,0);
     const end = new Date(value); end.setHours(0,0,0,0);
-    return calendarDaysBetween(start, end);
+    return calendarDaysBetween(anchor, end);
   }
   return Number(value||0);
+}
+// Range milestones (start date + stop date) have their own status logic rather than a single
+// "days remaining" number, since they can be upcoming, currently active, or already past.
+function rangeStatus(m){
+  const today = todayMidnight();
+  const start = new Date(m.startDate); start.setHours(0,0,0,0);
+  const end = new Date(m.endDate); end.setHours(0,0,0,0);
+  if(today < start){
+    const untilStart = calendarDaysBetween(today, start);
+    return {phase:'upcoming', remaining: untilStart, label:`Starts in ${untilStart} days`, cls:'amber'};
+  }
+  if(today <= end){
+    const untilEnd = calendarDaysBetween(today, end);
+    return {phase:'active', remaining: untilEnd, label:`${untilEnd} days left (in progress)`, cls: scheduleStatusClass(untilEnd)};
+  }
+  const daysPast = calendarDaysBetween(end, today);
+  return {phase:'past', remaining: -daysPast, label:`Ended ${daysPast} day${daysPast===1?'':'s'} ago`, cls:'grey'};
 }
 function scheduleStatusClass(remaining){
   if(remaining < 0) return 'red';
@@ -196,7 +233,15 @@ function scheduleStatusClass(remaining){
   return 'green';
 }
 function scheduleTypeLabel(type){
-  return type==='working' ? 'Working Days' : (type==='date' ? 'Fixed Date' : 'Calendar Days');
+  type = normalizeType(type);
+  switch(type){
+    case 'working-ntp': return 'Working Days (NTP)';
+    case 'calendar-ntp': return 'Calendar Days (NTP)';
+    case 'working-start': return 'Working Days (Actual Start)';
+    case 'calendar-start': return 'Calendar Days (Actual Start)';
+    case 'range': return 'Start/Stop Date Range';
+    default: return 'Fixed Date';
+  }
 }
 function fmtDate(d){
   if(!d) return '—';
@@ -324,9 +369,24 @@ function progressBar(pct, colorClass, labelLeft, labelRight){
     <div class="progress-track"><div class="progress-fill ${colorClass}" style="width:${pct}%;"></div></div>
   </div>`;
 }
+// Unified status for any milestone, whether it's a single-target type or a range (start/stop) type.
+function milestoneStatus(p, m){
+  if(normalizeType(m.type)==='range'){
+    const rs = rangeStatus(m);
+    return { remaining: rs.remaining, label: rs.label, cls: rs.cls, targetDate: new Date(m.endDate), phase: rs.phase };
+  }
+  const remaining = daysRemaining(p, m.type, m.value);
+  return {
+    remaining,
+    label: `${remaining}${remaining<0?' overdue':' days'}`,
+    cls: scheduleStatusClass(remaining),
+    targetDate: targetEndDate(p, m.type, m.value),
+    phase: remaining<0 ? 'past' : 'active',
+  };
+}
 function projectCard(p){
-  const remaining = daysRemaining(p.ntpDate, p.contractType, p.contractValue);
-  const total = totalDuration(p.ntpDate, p.contractType, p.contractValue);
+  const remaining = daysRemaining(p, p.contractType, p.contractValue);
+  const total = totalDuration(p, p.contractType, p.contractValue);
   const elapsed = total - remaining;
   const pctElapsed = total>0 ? (elapsed/total*100) : 0;
   const remClass = scheduleStatusClass(remaining);
@@ -335,9 +395,9 @@ function projectCard(p){
   const pctLabor = laborBudget>0 ? (laborUsed/laborBudget*100) : 0;
   const laborClass = laborStatusClass(pctLabor);
   const nextMilestone = (p.milestones||[])
-    .map(m=>({...m, remaining: daysRemaining(p.ntpDate, m.type, m.value)}))
-    .filter(m=>m.remaining >= 0)
-    .sort((a,b)=>a.remaining-b.remaining)[0];
+    .map(m=>({...m, status: milestoneStatus(p, m)}))
+    .filter(m=>m.status.remaining >= 0)
+    .sort((a,b)=>a.status.remaining-b.status.remaining)[0];
 
   return `<div class="proj-card" data-nav="project-detail" data-id="${p.id}">
     <div class="pnum">${esc(p.projectNumber)} <span class="tag ${p.status==='active'?'green':(p.status==='complete'?'grey':'amber')}" style="margin-left:6px;">${esc(p.status)}</span></div>
@@ -351,7 +411,7 @@ function projectCard(p){
     ${progressBar(pctElapsed, remClass==='red'?'red':(remClass==='amber'?'amber':'green'), 'Contract Time Elapsed', `${Math.round(pctElapsed)}%`)}
     ${progressBar(pctLabor, laborClass, 'Labor Hours Used', `${laborUsed.toLocaleString()} / ${laborBudget.toLocaleString()} hrs`)}
 
-    ${nextMilestone ? `<div class="milestone-mini">Next milestone: <strong>${esc(nextMilestone.label)}</strong> — ${nextMilestone.remaining} days</div>` : ''}
+    ${nextMilestone ? `<div class="milestone-mini">Next milestone: <strong>${esc(nextMilestone.label)}</strong> — ${nextMilestone.status.label}</div>` : ''}
   </div>`;
 }
 function dashboardView(){
@@ -368,28 +428,29 @@ function dashboardView(){
 /* ==================== Project detail ==================== */
 function milestoneTable(p){
   const rows = (p.milestones||[]).map(m=>{
-    const remaining = daysRemaining(p.ntpDate, m.type, m.value);
-    const cls = scheduleStatusClass(remaining);
-    const end = targetEndDate(p.ntpDate, m.type, m.value);
+    const s = milestoneStatus(p, m);
+    const dateDisplay = normalizeType(m.type)==='range'
+      ? `${fmtDate(m.startDate)} – ${fmtDate(m.endDate)}`
+      : fmtDate(s.targetDate);
     return `<tr>
       <td>${esc(m.label)}</td>
       <td>${scheduleTypeLabel(m.type)}</td>
-      <td>${fmtDate(end)}</td>
-      <td class="num"><span class="tag ${cls}">${remaining}${remaining<0?' overdue':' days'}</span></td>
+      <td>${dateDisplay}</td>
+      <td class="num"><span class="tag ${s.cls}">${s.label}</span></td>
     </tr>`;
   }).join('');
   return `<table>
-    <thead><tr><th>Milestone</th><th>Type</th><th>Target Date</th><th style="text-align:right;">Days Remaining</th></tr></thead>
+    <thead><tr><th>Milestone</th><th>Type</th><th>Target Date</th><th style="text-align:right;">Status</th></tr></thead>
     <tbody>${rows || '<tr><td colspan="4" style="color:var(--steel);">No milestones added yet.</td></tr>'}</tbody>
   </table>`;
 }
 function projectDetailView(p){
-  const remaining = daysRemaining(p.ntpDate, p.contractType, p.contractValue);
-  const total = totalDuration(p.ntpDate, p.contractType, p.contractValue);
+  const remaining = daysRemaining(p, p.contractType, p.contractValue);
+  const total = totalDuration(p, p.contractType, p.contractValue);
   const elapsed = total - remaining;
   const pctElapsed = total>0 ? (elapsed/total*100) : 0;
   const remClass = scheduleStatusClass(remaining);
-  const end = targetEndDate(p.ntpDate, p.contractType, p.contractValue);
+  const end = targetEndDate(p, p.contractType, p.contractValue);
   const laborBudget = Number(p.laborHoursBudget||0);
   const laborUsed = Number(p.laborHoursUsed||0);
   const pctLabor = laborBudget>0 ? (laborUsed/laborBudget*100) : 0;
@@ -412,6 +473,7 @@ function projectDetailView(p){
       <div class="kpi"><div class="label">Contract Completion</div><div class="value" style="font-size:20px;">${fmtDate(end)}</div></div>
       <div class="kpi"><div class="label">Labor Hours Remaining</div><div class="value">${(laborBudget-laborUsed).toLocaleString()}</div></div>
       <div class="kpi"><div class="label">NTP Date</div><div class="value" style="font-size:20px;">${fmtDate(p.ntpDate)}</div></div>
+      ${p.actualStartDate ? `<div class="kpi"><div class="label">Actual Start Date</div><div class="value" style="font-size:20px;">${fmtDate(p.actualStartDate)}</div></div>` : ''}
     </div>
 
     <div class="card">
@@ -452,22 +514,35 @@ function projectDetailView(p){
 }
 
 /* ==================== New/Edit Project modal ==================== */
-function emptyMilestone(){ return {id: 'ms_'+Math.random().toString(36).slice(2,10), label:'', type:'date', value:''}; }
+function emptyMilestone(){ return {id: 'ms_'+Math.random().toString(36).slice(2,10), label:'', type:'date', value:'', startDate:'', endDate:''}; }
 let modalMilestones = [];
 
 function milestoneRowHTML(m, idx){
+  const type = normalizeType(m.type);
+  const isDate = type==='date';
+  const isRange = type==='range';
+  let valueCell;
+  if(isRange){
+    valueCell = `<div style="display:flex;gap:6px;">
+      <div style="flex:1;"><label>Start Date</label><input type="date" data-ms-field="startDate" value="${esc(m.startDate||'')}"></div>
+      <div style="flex:1;"><label>Stop Date</label><input type="date" data-ms-field="endDate" value="${esc(m.endDate||'')}"></div>
+    </div>`;
+  } else {
+    valueCell = `<label>${isDate?'Date':'Days'}</label><input type="${isDate?'date':'number'}" data-ms-field="value" value="${esc(m.value||'')}">`;
+  }
   return `<div class="milestone-row" data-ms-idx="${idx}">
     <div class="field" style="margin-bottom:0;"><label>Milestone Label</label><input type="text" data-ms-field="label" value="${esc(m.label)}" placeholder="e.g. Interim Completion - Deck Pour"></div>
     <div class="field" style="margin-bottom:0;"><label>Type</label>
       <select data-ms-field="type">
-        <option value="date" ${m.type==='date'?'selected':''}>Fixed Date</option>
-        <option value="calendar" ${m.type==='calendar'?'selected':''}>Calendar Days from NTP</option>
-        <option value="working" ${m.type==='working'?'selected':''}>Working Days from NTP</option>
+        <option value="date" ${type==='date'?'selected':''}>Fixed Date</option>
+        <option value="calendar-ntp" ${type==='calendar-ntp'?'selected':''}>Calendar Days from NTP</option>
+        <option value="working-ntp" ${type==='working-ntp'?'selected':''}>Working Days from NTP</option>
+        <option value="calendar-start" ${type==='calendar-start'?'selected':''}>Calendar Days from Actual Start</option>
+        <option value="working-start" ${type==='working-start'?'selected':''}>Working Days from Actual Start</option>
+        <option value="range" ${type==='range'?'selected':''}>Start &amp; Stop Date</option>
       </select>
     </div>
-    <div class="field" style="margin-bottom:0;"><label>${m.type==='date'?'Date':'Days'}</label>
-      <input type="${m.type==='date'?'date':'number'}" data-ms-field="value" value="${esc(m.value)}">
-    </div>
+    <div class="field" style="margin-bottom:0;">${valueCell}</div>
     <button class="btn secondary small" data-ms-remove="${idx}" type="button" style="align-self:end;">✕</button>
   </div>`;
 }
@@ -496,7 +571,8 @@ function wireMilestoneRowEvents(){
 }
 function openProjectModal(existing){
   modalMilestones = existing ? JSON.parse(JSON.stringify(existing.milestones||[])) : [];
-  const p = existing || {projectNumber:'', projectName:'', owner:'', location:'', status:'active', ntpDate:'', contractType:'calendar', contractValue:'', laborHoursBudget:'', laborHoursUsed:''};
+  const p = existing || {projectNumber:'', projectName:'', owner:'', location:'', status:'active', ntpDate:'', actualStartDate:'', contractType:'calendar-ntp', contractValue:'', laborHoursBudget:'', laborHoursUsed:''};
+  const cType = normalizeType(p.contractType);
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
   backdrop.innerHTML = `
@@ -521,16 +597,20 @@ function openProjectModal(existing){
       <h3 style="margin-top:18px;">Contract Schedule</h3>
       <div class="grid cols-2">
         <div class="field"><label>Notice to Proceed (NTP) Date</label><input type="date" id="pf-ntp" value="${esc(p.ntpDate)}"></div>
-        <div class="field"><label>Contract Completion Type</label>
-          <select id="pf-contract-type">
-            <option value="calendar" ${p.contractType==='calendar'?'selected':''}>Calendar Days from NTP</option>
-            <option value="working" ${p.contractType==='working'?'selected':''}>Working Days from NTP</option>
-            <option value="date" ${p.contractType==='date'?'selected':''}>Fixed Completion Date</option>
-          </select>
-        </div>
+        <div class="field"><label>Actual Start Date</label><input type="date" id="pf-actual-start" value="${esc(p.actualStartDate||'')}"></div>
       </div>
-      <div class="field"><label id="pf-contract-value-label">${p.contractType==='date'?'Completion Date':'Number of Days'}</label>
-        <input type="${p.contractType==='date'?'date':'number'}" id="pf-contract-value" value="${esc(p.contractValue)}">
+      <div class="helptext" style="margin:-8px 0 14px 0;">Actual Start is optional — only needed if this contract counts days from when work actually began rather than from NTP.</div>
+      <div class="field"><label>Contract Completion Type</label>
+        <select id="pf-contract-type">
+          <option value="calendar-ntp" ${cType==='calendar-ntp'?'selected':''}>Calendar Days from NTP</option>
+          <option value="working-ntp" ${cType==='working-ntp'?'selected':''}>Working Days from NTP</option>
+          <option value="calendar-start" ${cType==='calendar-start'?'selected':''}>Calendar Days from Actual Start</option>
+          <option value="working-start" ${cType==='working-start'?'selected':''}>Working Days from Actual Start</option>
+          <option value="date" ${cType==='date'?'selected':''}>Fixed Completion Date</option>
+        </select>
+      </div>
+      <div class="field"><label id="pf-contract-value-label">${cType==='date'?'Completion Date':'Number of Days'}</label>
+        <input type="${cType==='date'?'date':'number'}" id="pf-contract-value" value="${esc(p.contractValue)}">
       </div>
 
       <h3 style="margin-top:18px;">Interim Milestones</h3>
@@ -568,10 +648,15 @@ function openProjectModal(existing){
     const projectNumber = document.getElementById('pf-number').value.trim();
     const projectName = document.getElementById('pf-name').value.trim();
     const ntpDate = document.getElementById('pf-ntp').value;
+    const actualStartDate = document.getElementById('pf-actual-start').value;
+    const contractType = document.getElementById('pf-contract-type').value;
     const contractValue = document.getElementById('pf-contract-value').value;
     if(!projectNumber || !projectName){ errEl.textContent = 'Project number and name are required.'; return; }
     if(!ntpDate){ errEl.textContent = 'NTP date is required to calculate schedule.'; return; }
     if(!contractValue){ errEl.textContent = 'Contract completion value is required.'; return; }
+    if((contractType==='calendar-start' || contractType==='working-start') && !actualStartDate){
+      errEl.textContent = 'Actual Start Date is required for this contract completion type.'; return;
+    }
 
     const newP = {
       id: existing ? existing.id : 'proj_'+Math.random().toString(36).slice(2,10),
@@ -580,9 +665,10 @@ function openProjectModal(existing){
       location: document.getElementById('pf-location').value.trim(),
       status: document.getElementById('pf-status').value,
       ntpDate,
-      contractType: document.getElementById('pf-contract-type').value,
+      actualStartDate,
+      contractType,
       contractValue,
-      milestones: modalMilestones.filter(m=>m.label && m.value),
+      milestones: modalMilestones.filter(m=> m.label && (normalizeType(m.type)==='range' ? (m.startDate && m.endDate) : m.value)),
       laborHoursBudget: document.getElementById('pf-labor-budget').value || 0,
       laborHoursUsed: document.getElementById('pf-labor-used').value || 0,
       laborHoursUpdatedDate: existing ? existing.laborHoursUpdatedDate : new Date().toISOString().slice(0,10),
